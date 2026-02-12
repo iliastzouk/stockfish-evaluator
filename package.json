@@ -6,7 +6,8 @@
   "main": "server-binary.js",
   "scripts": {
     "start": "node server-binary.js",
-    "dev": "node server-binary.js"
+    "dev": "node server-binary.js",
+    "local": "node server.js"
   },
   "engines": {
     "node": ">=18.0.0"
