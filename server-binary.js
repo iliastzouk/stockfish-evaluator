@@ -16,13 +16,9 @@ app.use((req, res, next) => {
   next();
 });
 
-// Optional auth middleware
 function authenticate(req, res, next) {
   const apiKey = process.env.STOCKFISH_API_KEY;
-  
-  if (!apiKey) {
-    return next();
-  }
+  if (!apiKey) return next();
 
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
@@ -42,16 +38,15 @@ function runStockfish(fen, depth) {
     const stockfishPath = process.env.STOCKFISH_PATH || "stockfish";
     const stockfish = spawn(stockfishPath);
 
-    let bestMove = null;
-    let evaluation = 0;
-    let mate = null;
+    let multipvResults = {};
     let timeout;
+
+    const fenFields = fen.split(" ");
+    const sideToMove = fenFields[1]; // "w" or "b"
 
     const cleanup = () => {
       clearTimeout(timeout);
-      try {
-        stockfish.kill();
-      } catch {}
+      try { stockfish.kill(); } catch {}
     };
 
     timeout = setTimeout(() => {
@@ -60,31 +55,88 @@ function runStockfish(fen, depth) {
     }, 15000);
 
     stockfish.stdout.on("data", (data) => {
-      const output = data.toString();
-      const lines = output.split("\n");
+      const lines = data.toString().split("\n");
 
       for (const line of lines) {
-        // Parse score from info lines
-        if (line.startsWith("info") && line.includes(" score ")) {
-          const cpMatch = line.match(/score cp (-?\d+)/);
+
+        // Parse multipv lines
+        if (line.startsWith("info") && line.includes(" multipv ")) {
+          const multipvMatch = line.match(/ multipv (\d+)/);
+          if (!multipvMatch) continue;
+
+          const multipvNum = parseInt(multipvMatch[1], 10);
+
+          const pvMatch = line.match(/ pv ((?:[a-h][1-8][a-h][1-8][qrbn]? ?)+)/);
+          const pvArr = pvMatch ? pvMatch[1].trim().split(/\s+/) : [];
+          const move = pvArr[0] || null;
+
+          let evaluation = null;
+          let mate = null;
+
           const mateMatch = line.match(/score mate (-?\d+)/);
+          const cpMatch = line.match(/score cp (-?\d+)/);
 
           if (mateMatch) {
-            mate = parseInt(mateMatch[1], 10);
+            const rawMate = parseInt(mateMatch[1], 10);
+
+            // Normalize mate to White perspective
+            mate = sideToMove === "b" ? -rawMate : rawMate;
+
             evaluation = mate > 0 ? 10000 : -10000;
-          } else if (cpMatch) {
-            evaluation = parseInt(cpMatch[1], 10);
+          }
+          else if (cpMatch) {
+            let rawEval = parseInt(cpMatch[1], 10);
+
+            // Normalize to White perspective
+            evaluation = sideToMove === "b" ? -rawEval : rawEval;
+          }
+
+          if (move && evaluation !== null) {
+            multipvResults[multipvNum] = {
+              move,
+              evaluation,
+              mate,
+              pv: pvArr
+            };
           }
         }
 
-        // Parse best move
+        // Parse bestmove → finish evaluation
         if (line.startsWith("bestmove")) {
-          const match = line.match(/^bestmove\s+([a-h][1-8][a-h][1-8][qrbn]?)/);
-          if (match) {
-            bestMove = match[1];
-          }
+
+          const moves = Object.keys(multipvResults)
+            .map(Number)
+            .sort((a, b) => a - b)
+            .map((n) => multipvResults[n])
+            .filter(m => m && m.move && m.evaluation !== null)
+            .sort((a, b) => {
+
+              // Mate priority
+              if (a.mate !== null && b.mate !== null) {
+                if (a.mate > 0 && b.mate > 0) return a.mate - b.mate;
+                if (a.mate < 0 && b.mate < 0) return b.mate - a.mate;
+                if (a.mate > 0) return -1;
+                if (b.mate > 0) return 1;
+              }
+
+              if (a.mate !== null) return a.mate > 0 ? -1 : 1;
+              if (b.mate !== null) return b.mate > 0 ? 1 : -1;
+
+              return b.evaluation - a.evaluation;
+            });
+
           cleanup();
-          resolve({ bestMove, evaluation, mate });
+
+          const bestMove = moves[0]?.move || null;
+          const primary = moves[0] || null;
+
+          resolve({
+            bestMove,
+            evaluation: primary?.evaluation ?? null,
+            mate: primary?.mate ?? null,
+            moves
+          });
+
           return;
         }
       }
@@ -99,9 +151,11 @@ function runStockfish(fen, depth) {
       reject(error);
     });
 
-    // Send UCI commands
+    // UCI flow
     stockfish.stdin.write("uci\n");
     stockfish.stdin.write("isready\n");
+    stockfish.stdin.write("setoption name MultiPV value 3\n");
+    stockfish.stdin.write("ucinewgame\n");
     stockfish.stdin.write(`position fen ${fen}\n`);
     stockfish.stdin.write(`go depth ${depth}\n`);
   });
