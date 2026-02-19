@@ -61,38 +61,64 @@ function parseScore(line) {
   return null;
 }
 
+function parseInfoLine(line) {
+  // Parse: info depth N ... multipv N score (cp|mate) N ... pv move1 move2 ...
+  const tokens = line.split(" ");
+
+  const get = (key) => {
+    const i = tokens.indexOf(key);
+    return i !== -1 ? tokens[i + 1] : null;
+  };
+
+  const multipv  = Number(get("multipv") ?? 1);
+  const scoreCp  = tokens.indexOf("cp")   !== -1 ? Number(tokens[tokens.indexOf("cp")   + 1]) : null;
+  const scoreMate= tokens.indexOf("mate") !== -1 ? Number(tokens[tokens.indexOf("mate") + 1]) : null;
+
+  // Extract PV: everything after the "pv" token
+  const pvIdx = tokens.indexOf("pv");
+  const pv    = pvIdx !== -1 ? tokens.slice(pvIdx + 1) : [];
+
+  // Evaluation: white-positive centipawns, ±10000 for mate
+  let evaluation = 0;
+  let mate       = null;
+  if (scoreMate !== null) {
+    mate       = scoreMate;
+    evaluation = scoreMate > 0 ? 10000 : -10000;
+  } else if (scoreCp !== null) {
+    evaluation = scoreCp;
+  }
+
+  return { multipv, evaluation, mate, pv, bestMove: pv[0] ?? null };
+}
+
 app.post("/evaluate", authenticate, async (req, res) => {
-  const { fen, depth = 18 } = req.body || {};
+  const { fen, depth = 18, multipv: requestedMultiPV = 3 } = req.body || {};
 
   if (!fen || typeof fen !== "string") {
     return res.status(400).json({ error: "Missing FEN" });
   }
 
+  const MULTIPV = Math.max(1, Math.min(Number(requestedMultiPV) || 3, 5));
+
   try {
-    // Dynamic import of stockfish.js (WASM version works in Node 18+)
     const sf = await import("stockfish.js");
     const engine = sf.default();
-    
-    let bestMove = null;
-    let scoreCp = null;
-    let mateIn = null;
-    let responded = false;
+
+    // pvSlots[1..MULTIPV] → latest parsed info for that multipv slot
+    const pvSlots   = {};
+    let   bestMove  = null;
+    let   responded = false;
 
     const timeoutId = setTimeout(() => {
       if (responded) return;
       responded = true;
       res.status(504).json({ error: "Stockfish timeout" });
-    }, 15000);
+    }, 20000);
 
     engine.addMessageListener((line) => {
-      if (line.startsWith("info") && line.includes(" score ")) {
-        const parsed = parseScore(line);
-        if (parsed?.type === "cp") {
-          scoreCp = parsed.value;
-        }
-        if (parsed?.type === "mate") {
-          mateIn = parsed.value;
-        }
+      if (line.startsWith("info") && line.includes(" score ") && line.includes(" pv ")) {
+        const parsed = parseInfoLine(line);
+        pvSlots[parsed.multipv] = parsed;
       }
 
       if (line.startsWith("bestmove")) {
@@ -101,10 +127,21 @@ app.post("/evaluate", authenticate, async (req, res) => {
         if (!responded) {
           responded = true;
           clearTimeout(timeoutId);
+
+          // Build moves array sorted by multipv slot (best first)
+          const moves = Object.keys(pvSlots)
+            .map(Number)
+            .sort((a, b) => a - b)
+            .map((slot) => pvSlots[slot]);
+
+          // Top line is the primary evaluation
+          const top = moves[0] ?? { evaluation: 0, mate: null, bestMove };
+
           res.json({
-            bestMove,
-            evaluation: mateIn !== null ? (mateIn > 0 ? 10000 : -10000) : (scoreCp || 0),
-            mate: mateIn
+            bestMove:   bestMove ?? top.bestMove,
+            evaluation: top.evaluation,
+            mate:       top.mate,
+            moves,   // [{ evaluation, mate, pv, bestMove }, ...]
           });
         }
 
@@ -113,7 +150,7 @@ app.post("/evaluate", authenticate, async (req, res) => {
     });
 
     engine.postMessage("uci");
-    engine.postMessage("setoption name MultiPV value 1");
+    engine.postMessage(`setoption name MultiPV value ${MULTIPV}`);
     engine.postMessage(`position fen ${fen}`);
     engine.postMessage(`go depth ${depth}`);
   } catch (error) {
