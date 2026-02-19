@@ -1,46 +1,48 @@
 import "dotenv/config";
 import express from "express";
-import { spawn } from "child_process";
+import { EnginePool } from "./src/engine/EnginePool.js";
 
-// Configurable deterministic settings
-const ENGINE_DEPTH = process.env.ENGINE_DEPTH ? parseInt(process.env.ENGINE_DEPTH, 10) : 18;
-const ENGINE_MULTIPV = process.env.ENGINE_MULTIPV ? parseInt(process.env.ENGINE_MULTIPV, 10) : 3;
+// Lightweight FEN validator — no external dependency needed.
+// Catches malformed strings that would crash the engine internally.
+// Structure: 8 ranks / side-to-move / castling / en-passant / half / full
+const FEN_RE =
+  /^([1-8prnbqkPRNBQK]+\/){7}[1-8prnbqkPRNBQK]+\s[bw]\s(-|[KQkq]{1,4})\s(-|[a-h][36])\s\d+\s\d+$/;
 
+function isValidFen(fen) {
+  return typeof fen === "string" && FEN_RE.test(fen.trim());
+}
 
+// ── Config ────────────────────────────────────────────────────────────────────
+const ENGINE_DEPTH     = process.env.ENGINE_DEPTH     ? parseInt(process.env.ENGINE_DEPTH,     10) : 18;
+const ENGINE_MULTIPV   = process.env.ENGINE_MULTIPV   ? parseInt(process.env.ENGINE_MULTIPV,   10) : 3;
+const ENGINE_POOL_SIZE = process.env.ENGINE_POOL_SIZE ? parseInt(process.env.ENGINE_POOL_SIZE, 10) : 2;
+const stockfishPath    = process.env.STOCKFISH_PATH   || "stockfish";
+const PORT             = process.env.PORT             || 3000;
+
+console.log("[Startup] Stockfish binary path:", stockfishPath);
+console.log("[Startup] Engine depth:         ", ENGINE_DEPTH);
+console.log("[Startup] MultiPV:              ", ENGINE_MULTIPV);
+console.log("[Startup] Pool size:            ", ENGINE_POOL_SIZE);
+console.log("[Startup] Node version:         ", process.version);
+
+// ── Engine pool (all instances spawned ONCE at startup) ────────────────────
+const pool = new EnginePool({
+  binaryPath: stockfishPath,
+  size:       ENGINE_POOL_SIZE,
+  multiPV:    ENGINE_MULTIPV,
+  threads:    1,      // keep 1 per engine on Railway Hobby — never oversubscribe CPU
+  maxQueue:   10,
+});
+
+// ── Express app ───────────────────────────────────────────────────────────────
 const app = express();
 app.use(express.json());
 
-
-// Startup observability logs
-const stockfishPath = process.env.STOCKFISH_PATH || "stockfish";
-
-console.log("[Startup] Stockfish binary path:", stockfishPath);
-console.log("[Startup] Engine depth:", ENGINE_DEPTH);
-console.log("[Startup] MultiPV:", ENGINE_MULTIPV);
-console.log("[Startup] Node version:", process.version);
-
-function logStockfishVersion() {
-  const proc = spawn(stockfishPath);
-  proc.stdout.on("data", (data) => {
-    const line = data.toString();
-    if (line.startsWith("Stockfish")) {
-      console.log("[Startup] Stockfish engine version:", line.trim());
-      proc.kill();
-    }
-  });
-  proc.stdin.write("uci\n");
-}
-logStockfishVersion();
-
 app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", process.env.CORS_ORIGIN || "*");
+  res.setHeader("Access-Control-Allow-Origin",  process.env.CORS_ORIGIN || "*");
   res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(204);
-  }
-
+  if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 
@@ -61,136 +63,45 @@ function authenticate(req, res, next) {
   next();
 }
 
-function runStockfish(fen, _depth) {
-  return new Promise((resolve, reject) => {
-    const stockfishPath = process.env.STOCKFISH_PATH || "stockfish";
-    const stockfish = spawn(stockfishPath);
-
-    let multipvResults = {};
-    let timeout;
-
-    const fenFields = fen.split(" ");
-    const sideToMove = fenFields[1]; // "w" or "b"
-
-    const cleanup = () => {
-      clearTimeout(timeout);
-      try { stockfish.kill(); } catch {}
-    };
-
-    timeout = setTimeout(() => {
-      cleanup();
-      reject(new Error("Stockfish timeout"));
-    }, 15000);
-
-    stockfish.stdout.on("data", (data) => {
-      const lines = data.toString().split("\n");
-
-      for (const line of lines) {
-        // Parse multipv lines
-        if (line.startsWith("info") && line.includes(" multipv ")) {
-          const multipvMatch = line.match(/ multipv (\d+)/);
-          if (!multipvMatch) continue;
-
-          const multipvNum = parseInt(multipvMatch[1], 10);
-          const pvMatch = line.match(/ pv ((?:[a-h][1-8][a-h][1-8][qrbn]? ?)+)/);
-          const pvArr = pvMatch ? pvMatch[1].trim().split(/\s+/) : [];
-          const move = pvArr[0] || null;
-
-          let evaluation = null;
-          let mate = null;
-
-          const mateMatch = line.match(/score mate (-?\d+)/);
-          const cpMatch = line.match(/score cp (-?\d+)/);
-
-          if (mateMatch) {
-            const rawMate = parseInt(mateMatch[1], 10);
-            mate = sideToMove === "b" ? -rawMate : rawMate;
-            evaluation = mate > 0 ? 10000 : -10000;
-          } else if (cpMatch) {
-            let rawEval = parseInt(cpMatch[1], 10);
-            evaluation = sideToMove === "b" ? -rawEval : rawEval;
-          }
-
-          if (move && evaluation !== null) {
-            multipvResults[multipvNum] = {
-              move,
-              evaluation,
-              mate,
-              pv: pvArr
-            };
-          }
-        }
-
-        // Parse bestmove → finish evaluation
-        if (line.startsWith("bestmove")) {
-          const moves = Object.keys(multipvResults)
-            .map(Number)
-            .sort((a, b) => a - b)
-            .map((n) => multipvResults[n])
-            .filter(m => m && m.move && m.evaluation !== null)
-            .sort((a, b) => {
-              // Mate priority
-              if (a.mate !== null && b.mate !== null) {
-                if (a.mate > 0 && b.mate > 0) return a.mate - b.mate;
-                if (a.mate < 0 && b.mate < 0) return b.mate - a.mate;
-                if (a.mate > 0) return -1;
-                if (b.mate > 0) return 1;
-              }
-              if (a.mate !== null) return a.mate > 0 ? -1 : 1;
-              if (b.mate !== null) return b.mate > 0 ? 1 : -1;
-              return b.evaluation - a.evaluation;
-            });
-          cleanup();
-          const bestMove = moves[0]?.move || null;
-          const primary = moves[0] || null;
-          resolve({
-            bestMove,
-            evaluation: primary?.evaluation ?? null,
-            mate: primary?.mate ?? null,
-            moves
-          });
-          return;
-        }
-      }
-    });
-
-    stockfish.stderr.on("data", (data) => {
-      console.error(`Stockfish error: ${data}`);
-    });
-
-    stockfish.on("error", (error) => {
-      cleanup();
-      reject(error);
-    });
-
-    // UCI flow (deterministic)
-    stockfish.stdin.write("uci\n");
-    stockfish.stdin.write("isready\n");
-    stockfish.stdin.write(`setoption name MultiPV value ${ENGINE_MULTIPV}\n`);
-    stockfish.stdin.write("setoption name Threads value 1\n");
-    stockfish.stdin.write("setoption name SyzygyProbeDepth value 0\n");
-    stockfish.stdin.write("ucinewgame\n");
-    stockfish.stdin.write(`position fen ${fen}\n`);
-    stockfish.stdin.write(`go depth ${ENGINE_DEPTH}\n`);
-  });
-}
-
+// ── Routes ────────────────────────────────────────────────────────────────────
 app.post("/evaluate", authenticate, async (req, res) => {
-  const { fen, depth = 18 } = req.body || {};
+  const { fen, depth = ENGINE_DEPTH } = req.body || {};
 
-  if (!fen || typeof fen !== "string") {
+  if (!fen) {
     return res.status(400).json({ error: "Missing FEN" });
   }
 
+  if (!isValidFen(fen)) {
+    return res.status(400).json({ error: "Invalid FEN" });
+  }
+
+  // Cap depth at route level — callers cannot force depth > 20
+  const cappedDepth = Math.min(Math.max(1, depth), 20);
+
   try {
-    const result = await runStockfish(fen, depth);
+    const result = await pool.evaluate(fen, cappedDepth);
     res.json(result);
   } catch (error) {
+    if (error.message === "Engine overloaded") {
+      // Queue full (>10 waiting) — caller must back off
+      return res.status(503).json({ error: "Engine overloaded. Retry shortly." });
+    }
     res.status(500).json({ error: "Stockfish error: " + error.message });
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log('[Startup] Stockfish service running on port ' + PORT);
+app.get("/health", (req, res) => {
+  res.json({ status: "ok", ...pool.getStatus() });
 });
+
+// ── Boot: init pool THEN open HTTP port ──────────────────────────────────────
+pool.init()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`[Startup] Stockfish service running on port ${PORT}`);
+    });
+  })
+  .catch((err) => {
+    console.error("[Startup] Failed to initialize engine pool:", err.message);
+    process.exit(1);
+  });
