@@ -23,6 +23,7 @@ RUN npm ci --only=production
 
 # Copy server code
 COPY server-binary.js ./
+COPY src/ ./src/
 
 # Expose port
 EXPOSE 3000
