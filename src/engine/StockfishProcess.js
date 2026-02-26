@@ -328,25 +328,17 @@ export class StockfishProcess {
 
   /**
    * Build the final result object from accumulated multipv data.
-   * Keeps the exact same sort logic as the original runStockfish().
+   * Moves are kept in multipv slot order (slot 1 = best for the side to move).
    */
   _buildResult() {
     const moves = Object.keys(this._multipvResults)
       .map(Number)
-      .sort((a, b) => a - b)
+      .sort((a, b) => a - b)   // keep multipv slot order: slot 1 = best for side to move
       .map((n) => this._multipvResults[n])
-      .filter((m) => m && m.move && m.evaluation !== null)
-      .sort((a, b) => {
-        if (a.mate !== null && b.mate !== null) {
-          if (a.mate > 0 && b.mate > 0) return a.mate - b.mate;
-          if (a.mate < 0 && b.mate < 0) return b.mate - a.mate;
-          if (a.mate > 0) return -1;
-          if (b.mate > 0) return 1;
-        }
-        if (a.mate !== null) return a.mate > 0 ? -1 : 1;
-        if (b.mate !== null) return b.mate > 0 ? 1 : -1;
-        return b.evaluation - a.evaluation;
-      });
+      .filter((m) => m && m.move && m.evaluation !== null);
+    // NOTE: do NOT re-sort by evaluation here. The engine already orders multipv slots
+    // correctly for the side to move (slot 1 = best). Re-sorting by white-positive
+    // evaluation would put the worst black move first when black is to move.
 
     const primary = moves[0] || null;
 
