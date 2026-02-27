@@ -1,6 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import { EnginePool } from "./src/engine/EnginePool.js";
+import { initRedis, getCacheMetrics } from "./src/cache/RedisCache.js";
 
 // Lightweight FEN validator — no external dependency needed.
 // Catches malformed strings that would crash the engine internally.
@@ -91,11 +92,18 @@ app.post("/evaluate", authenticate, async (req, res) => {
 });
 
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", ...pool.getStatus() });
+  res.json({
+    status:  "ok",
+    engine:  pool.getStatus(),
+    cache:   getCacheMetrics(),
+  });
 });
 
-// ── Boot: init pool THEN open HTTP port ──────────────────────────────────────
-pool.init()
+// ── Boot: Redis → engine pool → HTTP ────────────────────────────────────────────
+// Redis init is non-fatal: if it fails, the service starts without caching.
+// Engine pool init IS fatal: if Stockfish can't start, abort immediately.
+initRedis()
+  .then(() => pool.init())
   .then(() => {
     app.listen(PORT, () => {
       console.log(`[Startup] Stockfish service running on port ${PORT}`);

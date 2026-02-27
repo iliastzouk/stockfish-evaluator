@@ -21,6 +21,7 @@
  */
 
 import { StockfishProcess } from "./StockfishProcess.js";
+import { cacheGet, cacheSet } from "../cache/RedisCache.js";
 
 const DEFAULT_MAX_QUEUE = 10;
 
@@ -87,6 +88,12 @@ export class EnginePool {
       throw new Error("No engines available");
     }
 
+    // ── Cache check (Redis L1) ─────────────────────────────────────────────
+    // Returns null when cache is disabled or on any Redis error — no-op.
+    const cached = await cacheGet(fen, depth);
+    if (cached) return cached;
+
+    // ── Engine dispatch ────────────────────────────────────────────────────
     // Idle engine available — use it immediately
     if (this._available.length > 0) {
       const engine = this._available.shift();
@@ -161,6 +168,10 @@ export class EnginePool {
     return p.then(
       (result) => {
         this._release(engine);
+        // ── Cache write (fire-and-forget, never blocks response) ───────────
+        // Both the direct-dispatch path and the queued path flow through
+        // _runOnEngine(), so this single write covers all cache population.
+        cacheSet(fen, depth, result).catch(() => {}); // errors handled inside cacheSet
         return result;
       },
       (err) => {
