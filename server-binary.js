@@ -84,11 +84,31 @@ app.post("/evaluate", authenticate, async (req, res) => {
     res.json(result);
   } catch (error) {
     if (error.message === "Engine overloaded") {
-      // Queue full (>10 waiting) — caller must back off
       return res.status(503).json({ error: "Engine overloaded. Retry shortly." });
+    }
+    if (error.message === "No engines available") {
+      return res.status(503).json({ error: "No engines available — respawn may be in progress. Retry shortly." });
+    }
+    if (error.message.startsWith("Engine crashed")) {
+      return res.status(503).json({ error: error.message + " Retry shortly." });
     }
     res.status(500).json({ error: "Stockfish error: " + error.message });
   }
+});
+
+// POST /recover — manually trigger engine respawn when all engines have crashed.
+// Protected by auth. Safe to call multiple times; _respawnEngine is idempotent.
+app.post("/recover", authenticate, async (req, res) => {
+  const status = pool.getStatus();
+  if (status.totalEngines > 0) {
+    return res.json({ message: "Pool is healthy — no recovery needed.", status });
+  }
+  if (status.respawning > 0) {
+    return res.json({ message: "Respawn already in progress.", status });
+  }
+  // Trigger up to ENGINE_POOL_SIZE respawns
+  pool.forceRespawn(ENGINE_POOL_SIZE);
+  res.json({ message: `Triggered ${ENGINE_POOL_SIZE} engine respawn(s).`, status: pool.getStatus() });
 });
 
 app.get("/health", (req, res) => {

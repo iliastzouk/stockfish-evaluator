@@ -81,6 +81,12 @@ export class StockfishProcess {
     this._proc.on("exit", (code, signal) => {
       console.warn(`[StockfishProcess] process exited (code=${code} signal=${signal})`);
       this._ready = false;
+      // If an evaluation was running, reject it so the pool can discard this engine.
+      if (this._currentReject) {
+        const reject = this._currentReject;
+        this._cleanupEval();
+        reject(new Error(`Engine process exited unexpectedly (code=${code} signal=${signal})`));
+      }
     });
 
     // Wait for uciok
@@ -241,9 +247,16 @@ export class StockfishProcess {
 
   /**
    * Write a raw UCI command string to stdin.
+   * No-op if the process has already exited (closed stdin).
    */
   _write(cmd) {
-    this._proc.stdin.write(cmd);
+    try {
+      if (this._proc && !this._proc.stdin.destroyed) {
+        this._proc.stdin.write(cmd);
+      }
+    } catch (err) {
+      console.error("[StockfishProcess] stdin write failed:", err.message);
+    }
   }
 
   /**

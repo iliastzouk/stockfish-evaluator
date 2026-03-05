@@ -35,6 +35,12 @@ export class EnginePool {
    * @param {number} [options.maxQueue=10] Max queued requests before overflow
    */
   constructor({ binaryPath, size = 2, multiPV = 3, threads = 1, maxQueue = DEFAULT_MAX_QUEUE }) {
+    // Store config for auto-respawn
+    this._binaryPath = binaryPath;
+    this._multiPV    = multiPV;
+    this._threads    = threads;
+    this._poolSize   = size;
+
     this._engines   = Array.from({ length: size }, () =>
       new StockfishProcess(binaryPath, { multiPV, threads })
     );
@@ -47,6 +53,9 @@ export class EnginePool {
     // Each slot: { fen, depth, resolve, reject }
     this._queue    = [];
     this._maxQueue = maxQueue;
+
+    // Track in-flight respawn attempts to avoid spawning more than pool size
+    this._respawning = 0;
   }
 
   // ── Public API ─────────────────────────────────────────────────────────────
@@ -72,6 +81,17 @@ export class EnginePool {
 
     process.once("SIGTERM", () => shutdown("SIGTERM"));
     process.once("SIGINT",  () => shutdown("SIGINT"));
+
+    // Periodic health watchdog: every 2 minutes, check if pool is depleted
+    // and trigger respawn if needed. Guards against engines crashing silently.
+    this._watchdog = setInterval(() => {
+      const live = this._engines.length + this._respawning;
+      if (live < this._poolSize) {
+        const needed = this._poolSize - live;
+        console.warn(`[EnginePool] Watchdog: only ${live}/${this._poolSize} engines alive — spawning ${needed} replacement(s).`);
+        for (let i = 0; i < needed; i++) this._respawnEngine();
+      }
+    }, 2 * 60 * 1_000).unref();
   }
 
   /**
@@ -83,8 +103,8 @@ export class EnginePool {
    * @throws {Error} "Engine overloaded" if queue is full
    */
   async evaluate(fen, depth) {
-    // Guard: all engines may have been discarded due to crashes
-    if (this._engines.length === 0) {
+    // Guard: all engines have crashed AND no respawn is underway
+    if (this._engines.length === 0 && this._respawning === 0) {
       throw new Error("No engines available");
     }
 
@@ -100,7 +120,7 @@ export class EnginePool {
       return this._runOnEngine(engine, fen, depth);
     }
 
-    // All busy — queue or reject
+    // All busy (or respawning) — queue or reject
     if (this._queue.length >= this._maxQueue) {
       throw new Error("Engine overloaded");
     }
@@ -120,13 +140,34 @@ export class EnginePool {
       totalEngines: this._engines.length,
       busyEngines:  this._engines.length - this._available.length,
       queueLength:  this._queue.length,
+      respawning:   this._respawning,
     };
+  }
+
+  /**
+   * Manually trigger respawn of `count` engines. Called from /recover endpoint.
+   * Will not exceed ENGINE_POOL_SIZE total engines.
+   *
+   * @param {number} count  How many engines to spawn
+   */
+  forceRespawn(count) {
+    const needed = Math.min(count, this._poolSize - this._engines.length - this._respawning);
+    for (let i = 0; i < needed; i++) {
+      this._respawnEngine();
+    }
+    console.log(`[EnginePool] forceRespawn triggered: ${needed} engine(s) spawning.`);
   }
 
   /**
    * Reject all queued requests and shut down every engine cleanly.
    */
   async quit() {
+    // Stop watchdog
+    if (this._watchdog) {
+      clearInterval(this._watchdog);
+      this._watchdog = null;
+    }
+
     // Drain queue — callers waiting must receive a rejection
     for (const { reject } of this._queue) {
       reject(new Error("Engine pool shutting down"));
@@ -202,17 +243,69 @@ export class EnginePool {
       this._available = this._available.filter((e) => e !== engine);
       console.error(
         `[EnginePool] Engine discarded after crash (${err.message}). ` +
-        `Pool capacity: ${this._engines.length} engine(s).`
+        `Pool capacity: ${this._engines.length} engine(s). Spawning replacement…`
       );
-      // Drain one queued caller with the crash error so it's not stuck.
+      // Drain one queued caller with a retryable error — it shouldn't wait
+      // behind the crash while a replacement is starting.
       if (this._queue.length > 0) {
         const { reject } = this._queue.shift();
-        reject(new Error("Engine crashed — no replacement available yet"));
+        reject(new Error("Engine crashed — respawning, retry in a few seconds"));
+      }
+      // Phase 2: Auto-respawn replacement engine
+      const targetSize = this._poolSize;
+      const currentAlive = this._engines.length + this._respawning;
+      if (currentAlive < targetSize) {
+        this._respawnEngine();
       }
       return;
     }
     // Engine is still alive — return it normally.
     this._release(engine);
+  }
+
+  /**
+   * Spawn a single replacement engine and add it to the pool once ready.
+   * Retries up to 3 times with exponential back-off (1s, 2s, 4s).
+   * Fire-and-forget — never throws; caller doesn't need to await.
+   *
+   * @param {number} attempt  Current attempt index (0-based)
+   */
+  async _respawnEngine(attempt = 0) {
+    const MAX_ATTEMPTS = 3;
+    this._respawning++;
+
+    if (attempt > 0) {
+      const delay = Math.min(1_000 * Math.pow(2, attempt - 1), 8_000);
+      console.log(`[EnginePool] Respawn attempt ${attempt + 1}/${MAX_ATTEMPTS} in ${delay}ms…`);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+
+    const newEngine = new StockfishProcess(this._binaryPath, {
+      multiPV: this._multiPV,
+      threads: this._threads,
+    });
+
+    try {
+      await newEngine.init();
+      this._engines.push(newEngine);
+      this._respawning--;
+      console.log(
+        `[EnginePool] Engine respawned successfully. ` +
+        `Pool capacity: ${this._engines.length} engine(s).`
+      );
+      // Hand it to any waiting caller, or park it idle
+      this._release(newEngine);
+    } catch (spawnErr) {
+      this._respawning--;
+      console.error(
+        `[EnginePool] Respawn attempt ${attempt + 1} failed: ${spawnErr.message}`
+      );
+      if (attempt + 1 < MAX_ATTEMPTS) {
+        this._respawnEngine(attempt + 1);
+      } else {
+        console.error("[EnginePool] All respawn attempts exhausted — pool may be permanently empty.");
+      }
+    }
   }
 
   /**
