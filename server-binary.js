@@ -129,6 +129,31 @@ app.get("/health", (req, res) => {
   });
 });
 
+// More detailed status for admin dashboards
+app.get("/status", (req, res) => {
+  const engine = pool.getStatus();
+  const cache = getCacheMetrics();
+  res.json({
+    status: "ok",
+    engine: {
+      poolSize: engine.totalEngines,
+      busyEngines: engine.busyEngines,
+      queuedRequests: engine.queueLength,
+      respawning: engine.respawning,
+    },
+    cache: {
+      hits: cache.hits,
+      misses: cache.misses,
+      writes: cache.writes,
+      errors: cache.errors,
+      hitRate: cache.hitRate,
+      ready: cache.ready,
+      perFeature: cache.perFeature,
+    },
+    recentErrors: [], // placeholder for future in-memory error buffer
+  });
+});
+
 app.use(errorLoggingMiddleware());
 
 // ── Boot: Redis → engine pool → HTTP ────────────────────────────────────────────

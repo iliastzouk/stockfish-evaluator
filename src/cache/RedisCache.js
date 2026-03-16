@@ -28,6 +28,7 @@ let _client = null;
 let _ready  = false;
 
 const _metrics = { hits: 0, misses: 0, errors: 0, writes: 0 };
+const _featureMetrics = Object.create(null); // feature -> { hits, misses }
 
 // ── Public: Init ──────────────────────────────────────────────────────────────
 
@@ -102,16 +103,24 @@ export async function initRedis() {
  * @param  {number} depth
  * @returns {Promise<object|null>}  Parsed result or null on miss / error / cache-disabled
  */
-export async function cacheGet(fen, depth) {
+export async function cacheGet(fen, depth, { multipv = 1, feature = null } = {}) {
   if (!_ready) return null;
 
   try {
-    const raw = await _client.get(_key(fen, depth));
+    const raw = await _client.get(_key(fen, depth, multipv));
     if (raw) {
       _metrics.hits++;
+      if (feature) {
+        const fm = (_featureMetrics[feature] ||= { hits: 0, misses: 0 });
+        fm.hits++;
+      }
       return JSON.parse(raw);
     }
     _metrics.misses++;
+    if (feature) {
+      const fm = (_featureMetrics[feature] ||= { hits: 0, misses: 0 });
+      fm.misses++;
+    }
     return null;
   } catch (err) {
     _metrics.errors++;
@@ -127,11 +136,12 @@ export async function cacheGet(fen, depth) {
  * @param  {object} result
  * @returns {Promise<void>}
  */
-export async function cacheSet(fen, depth, result) {
+export async function cacheSet(fen, depth, result, { multipv = 1 } = {}) {
   if (!_ready) return;
 
   try {
-    await _client.set(_key(fen, depth), JSON.stringify(result), { EX: TTL_SECONDS });
+    const ttl = _ttlForDepth(depth);
+    await _client.set(_key(fen, depth, multipv), JSON.stringify(result), { EX: ttl });
     _metrics.writes++;
   } catch (err) {
     _metrics.errors++;
@@ -148,17 +158,34 @@ export async function cacheSet(fen, depth, result) {
  */
 export function getCacheMetrics() {
   const total = _metrics.hits + _metrics.misses;
+  const perFeature = {};
+  for (const [feat, m] of Object.entries(_featureMetrics)) {
+    const t = m.hits + m.misses;
+    perFeature[feat] = {
+      hits: m.hits,
+      misses: m.misses,
+      hitRate: t > 0 ? `${((m.hits / t) * 100).toFixed(1)}%` : "n/a",
+    };
+  }
   return {
     ..._metrics,
     hitRate: total > 0 ? `${((_metrics.hits / total) * 100).toFixed(1)}%` : "n/a",
     ready:   _ready,
+    perFeature,
   };
 }
 
 // ── Private ───────────────────────────────────────────────────────────────────
 
-function _key(fen, depth) {
-  return `eval:${fen}:${depth}`;
+function _key(fen, depth, multipv) {
+  return `eval:${fen}:${depth}:mpv${multipv}`;
+}
+
+function _ttlForDepth(depth) {
+  const d = Number(depth) || 0;
+  if (d <= 10) return 5 * 60;           // 5 min
+  if (d <= 18) return 60 * 60;          // 1 hour
+  return 24 * 60 * 60;                  // 24 hours
 }
 
 function _logMetrics() {

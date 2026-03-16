@@ -120,7 +120,7 @@ export class EnginePool {
 
     // ── Cache check (Redis L1) ─────────────────────────────────────────────
     // Returns null when cache is disabled or on any Redis error — no-op.
-    const cached = await cacheGet(fen, depth);
+    const cached = await cacheGet(fen, depth, { multipv: this._multiPV, feature: "evaluation" });
     if (cached) {
       const latencyMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
       logInfo("enginepool_cache_hit", {
@@ -257,7 +257,7 @@ export class EnginePool {
         // ── Cache write (fire-and-forget, never blocks response) ───────────
         // Both the direct-dispatch path and the queued path flow through
         // _runOnEngine(), so this single write covers all cache population.
-        cacheSet(fen, depth, result).catch(() => {}); // errors handled inside cacheSet
+        cacheSet(fen, depth, result, { multipv: this._multiPV }).catch(() => {}); // errors handled inside cacheSet
         const latencyMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
         logInfo("enginepool_eval_ok", {
           feature: "evaluation",
