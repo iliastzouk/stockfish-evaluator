@@ -1,8 +1,11 @@
 import express from "express";
 import { Engine } from "node-uci";
+import { requestContextMiddleware, errorLoggingMiddleware } from "./src/observability/httpLogging.js";
+import { logInfo, logError } from "./src/observability/logger.js";
 
 const app = express();
 app.use(express.json());
+app.use(requestContextMiddleware());
 
 // Optional auth middleware
 function authenticate(req, res, next) {
@@ -74,11 +77,19 @@ app.post("/evaluate", authenticate, async (req, res) => {
         await engine.quit();
       } catch {}
     }
+    logError("http_evaluate_failed", {
+      correlationId: req.correlationId,
+      requestId: req.requestId,
+      feature: req.feature,
+      error,
+    });
     res.status(500).json({ error: `Stockfish error: ${error.message}` });
   }
 });
 
+app.use(errorLoggingMiddleware());
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Stockfish service running on port ${PORT}`);
+  logInfo("http_server_started", { feature: "evaluation", port: PORT });
 });

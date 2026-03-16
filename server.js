@@ -1,7 +1,10 @@
 import express from "express";
+import { requestContextMiddleware, errorLoggingMiddleware } from "./src/observability/httpLogging.js";
+import { logInfo, logError } from "./src/observability/logger.js";
 
 const app = express();
 app.use(express.json());
+app.use(requestContextMiddleware());
 
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", process.env.CORS_ORIGIN || "*");
@@ -154,11 +157,19 @@ app.post("/evaluate", authenticate, async (req, res) => {
     engine.postMessage(`position fen ${fen}`);
     engine.postMessage(`go depth ${depth}`);
   } catch (error) {
+    logError("http_evaluate_failed", {
+      correlationId: req.correlationId,
+      requestId: req.requestId,
+      feature: req.feature,
+      error,
+    });
     res.status(500).json({ error: `Stockfish error: ${error.message}` });
   }
 });
 
+app.use(errorLoggingMiddleware());
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Stockfish service running on port ${PORT}`);
+  logInfo("http_server_started", { feature: "evaluation", port: PORT });
 });

@@ -2,6 +2,8 @@ import "dotenv/config";
 import express from "express";
 import { EnginePool } from "./src/engine/EnginePool.js";
 import { initRedis, getCacheMetrics } from "./src/cache/RedisCache.js";
+import { requestContextMiddleware, errorLoggingMiddleware } from "./src/observability/httpLogging.js";
+import { logInfo, logError } from "./src/observability/logger.js";
 
 // Lightweight FEN validator — no external dependency needed.
 // Catches malformed strings that would crash the engine internally.
@@ -38,6 +40,7 @@ const pool = new EnginePool({
 // ── Express app ───────────────────────────────────────────────────────────────
 const app = express();
 app.use(express.json());
+app.use(requestContextMiddleware());
 
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin",  process.env.CORS_ORIGIN || "*");
@@ -83,6 +86,13 @@ app.post("/evaluate", authenticate, async (req, res) => {
     const result = await pool.evaluate(fen, cappedDepth);
     res.json(result);
   } catch (error) {
+    logError("http_evaluate_failed", {
+      correlationId: req.correlationId,
+      requestId: req.requestId,
+      feature: req.feature,
+      depth: cappedDepth,
+      error,
+    });
     if (error.message === "Engine overloaded") {
       return res.status(503).json({ error: "Engine overloaded. Retry shortly." });
     }
@@ -119,6 +129,8 @@ app.get("/health", (req, res) => {
   });
 });
 
+app.use(errorLoggingMiddleware());
+
 // ── Boot: Redis → engine pool → HTTP ────────────────────────────────────────────
 // Redis init is non-fatal: if it fails, the service starts without caching.
 // Engine pool init IS fatal: if Stockfish can't start, abort immediately.
@@ -126,10 +138,10 @@ initRedis()
   .then(() => pool.init())
   .then(() => {
     app.listen(PORT, () => {
-      console.log(`[Startup] Stockfish service running on port ${PORT}`);
+      logInfo("http_server_started", { feature: "evaluation", port: PORT });
     });
   })
   .catch((err) => {
-    console.error("[Startup] Failed to initialize engine pool:", err.message);
+    logError("startup_engine_pool_failed", { feature: "evaluation", error: err });
     process.exit(1);
   });

@@ -22,6 +22,7 @@
 
 import { StockfishProcess } from "./StockfishProcess.js";
 import { cacheGet, cacheSet } from "../cache/RedisCache.js";
+import { logInfo, logWarn, logError } from "../observability/logger.js";
 
 const DEFAULT_MAX_QUEUE = 10;
 
@@ -103,29 +104,72 @@ export class EnginePool {
    * @throws {Error} "Engine overloaded" if queue is full
    */
   async evaluate(fen, depth) {
+    const startedAt = process.hrtime.bigint();
     // Guard: all engines have crashed AND no respawn is underway
     if (this._engines.length === 0 && this._respawning === 0) {
+      logError("enginepool_no_engines", {
+        feature: "evaluation",
+        depth,
+        queueLength: this._queue.length,
+        available: this._available.length,
+        totalEngines: this._engines.length,
+        respawning: this._respawning,
+      });
       throw new Error("No engines available");
     }
 
     // ── Cache check (Redis L1) ─────────────────────────────────────────────
     // Returns null when cache is disabled or on any Redis error — no-op.
     const cached = await cacheGet(fen, depth);
-    if (cached) return cached;
+    if (cached) {
+      const latencyMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+      logInfo("enginepool_cache_hit", {
+        feature: "evaluation",
+        depth,
+        latencyMs: Math.round(latencyMs),
+        queueLength: this._queue.length,
+        available: this._available.length,
+        totalEngines: this._engines.length,
+      });
+      return cached;
+    }
 
     // ── Engine dispatch ────────────────────────────────────────────────────
     // Idle engine available — use it immediately
     if (this._available.length > 0) {
       const engine = this._available.shift();
+      logInfo("enginepool_dispatch_immediate", {
+        feature: "evaluation",
+        depth,
+        queueLength: this._queue.length,
+        availableAfterAcquire: this._available.length,
+        totalEngines: this._engines.length,
+      });
       return this._runOnEngine(engine, fen, depth);
     }
 
     // All busy (or respawning) — queue or reject
     if (this._queue.length >= this._maxQueue) {
+      logWarn("enginepool_overloaded", {
+        feature: "evaluation",
+        depth,
+        queueLength: this._queue.length,
+        maxQueue: this._maxQueue,
+        totalEngines: this._engines.length,
+        respawning: this._respawning,
+      });
       throw new Error("Engine overloaded");
     }
 
     return new Promise((resolve, reject) => {
+      logInfo("enginepool_queued", {
+        feature: "evaluation",
+        depth,
+        queueLength: this._queue.length + 1,
+        maxQueue: this._maxQueue,
+        totalEngines: this._engines.length,
+        respawning: this._respawning,
+      });
       this._queue.push({ fen, depth, resolve, reject });
     });
   }
@@ -196,6 +240,7 @@ export class EnginePool {
    * @returns {Promise<EvalResult>}
    */
   _runOnEngine(engine, fen, depth) {
+    const startedAt = process.hrtime.bigint();
     let p;
     try {
       p = engine.evaluate(fen, depth);
@@ -213,10 +258,29 @@ export class EnginePool {
         // Both the direct-dispatch path and the queued path flow through
         // _runOnEngine(), so this single write covers all cache population.
         cacheSet(fen, depth, result).catch(() => {}); // errors handled inside cacheSet
+        const latencyMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+        logInfo("enginepool_eval_ok", {
+          feature: "evaluation",
+          depth,
+          latencyMs: Math.round(latencyMs),
+          queueLength: this._queue.length,
+          totalEngines: this._engines.length,
+          respawning: this._respawning,
+        });
         return result;
       },
       (err) => {
         this._discardOrRelease(engine, err);
+        const latencyMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+        logError("enginepool_eval_error", {
+          feature: "evaluation",
+          depth,
+          latencyMs: Math.round(latencyMs),
+          queueLength: this._queue.length,
+          totalEngines: this._engines.length,
+          respawning: this._respawning,
+          error: err,
+        });
         throw err;
       }
     );
@@ -241,10 +305,12 @@ export class EnginePool {
       // busy, but filter anyway to prevent a broken reference leaking back).
       this._engines   = this._engines.filter((e) => e !== engine);
       this._available = this._available.filter((e) => e !== engine);
-      console.error(
-        `[EnginePool] Engine discarded after crash (${err.message}). ` +
-        `Pool capacity: ${this._engines.length} engine(s). Spawning replacement…`
-      );
+      logError("enginepool_engine_discarded", {
+        feature: "evaluation",
+        totalEngines: this._engines.length,
+        respawning: this._respawning,
+        error: err,
+      });
       // Drain one queued caller with a retryable error — it shouldn't wait
       // behind the crash while a replacement is starting.
       if (this._queue.length > 0) {
@@ -276,7 +342,12 @@ export class EnginePool {
 
     if (attempt > 0) {
       const delay = Math.min(1_000 * Math.pow(2, attempt - 1), 8_000);
-      console.log(`[EnginePool] Respawn attempt ${attempt + 1}/${MAX_ATTEMPTS} in ${delay}ms…`);
+      logWarn("enginepool_respawn_scheduled", {
+        feature: "evaluation",
+        attempt: attempt + 1,
+        maxAttempts: MAX_ATTEMPTS,
+        delayMs: delay,
+      });
       await new Promise((r) => setTimeout(r, delay));
     }
 
@@ -289,21 +360,25 @@ export class EnginePool {
       await newEngine.init();
       this._engines.push(newEngine);
       this._respawning--;
-      console.log(
-        `[EnginePool] Engine respawned successfully. ` +
-        `Pool capacity: ${this._engines.length} engine(s).`
-      );
+      logInfo("enginepool_respawn_ok", {
+        feature: "evaluation",
+        totalEngines: this._engines.length,
+        respawning: this._respawning,
+      });
       // Hand it to any waiting caller, or park it idle
       this._release(newEngine);
     } catch (spawnErr) {
       this._respawning--;
-      console.error(
-        `[EnginePool] Respawn attempt ${attempt + 1} failed: ${spawnErr.message}`
-      );
+      logError("enginepool_respawn_failed", {
+        feature: "evaluation",
+        attempt: attempt + 1,
+        maxAttempts: MAX_ATTEMPTS,
+        error: spawnErr,
+      });
       if (attempt + 1 < MAX_ATTEMPTS) {
         this._respawnEngine(attempt + 1);
       } else {
-        console.error("[EnginePool] All respawn attempts exhausted — pool may be permanently empty.");
+        logError("enginepool_respawn_exhausted", { feature: "evaluation" });
       }
     }
   }
@@ -319,6 +394,13 @@ export class EnginePool {
     if (this._queue.length > 0) {
       // Dequeue oldest waiting caller — FIFO
       const { fen, depth, resolve, reject } = this._queue.shift();
+      logInfo("enginepool_dequeue", {
+        feature: "evaluation",
+        depth,
+        queueLength: this._queue.length,
+        totalEngines: this._engines.length,
+        respawning: this._respawning,
+      });
       // Hand engine directly to queued work; never enters _available
       this._runOnEngine(engine, fen, depth).then(resolve).catch(reject);
     } else {
